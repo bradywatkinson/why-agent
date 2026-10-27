@@ -1,0 +1,11 @@
+node_modules/
+vendor/
+.notebook/
+.memory/
+.runs/
+.env
+.env.*
+!.env.example
+*.log
+zetaris/platform/
+zetaris/*.zip
