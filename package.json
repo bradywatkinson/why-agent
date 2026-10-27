@@ -12,7 +12,8 @@
     "ask": "tsx src/cli.ts ask",
     "test": "tsx --test test/*.test.ts",
     "scout:evals": "./scripts/scout-evals.sh",
-    "zetaris:check": "tsx src/cli.ts sql \"SHOW LIGHTNING DATABASES\""
+    "zetaris:check": "tsx src/cli.ts sql \"SHOW LIGHTNING DATABASES\"",
+    "zetaris:token": "tsx scripts/zetaris-api-token.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
