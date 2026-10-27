@@ -26,6 +26,8 @@ export interface QueryStep {
   dataFindings: { row: number; col: number; kinds: string[] }[];
   error?: string;
   at: string;
+  /** Set when the step is a client-side roll-up of another query's rows (no extra engine scan). */
+  derivedFrom?: { queryId: string; rows: number[] };
 }
 
 export type Citation = { kind: "query"; queryId: string; rows: number[] } | { kind: "memory"; memoryId: string } | { kind: "reference"; label: string };
@@ -87,13 +89,13 @@ export interface RunRecord {
   events: AuditEvent[];
 }
 
-const PAYMENT_LABELS: Record<string, string> = { "1": "Credit card", "2": "Cash", "3": "No charge", "4": "Dispute", "5": "Unknown", "6": "Voided trip", "0": "Unspecified" };
+const PAYMENT_LABELS: Record<string, string> = { "1": "Credit card", "2": "Cash", "3": "No charge", "4": "Dispute", "5": "Unknown", "6": "Voided trip", "0": "Code 0 (unlisted)" };
 const RATECODE_LABELS: Record<string, string> = { "1": "Standard rate", "2": "JFK flat fare", "3": "Newark", "4": "Nassau/Westchester", "5": "Negotiated fare", "6": "Group ride", "99": "Unknown" };
 const TLC_DICT = "NYC TLC Yellow Taxi data dictionary (code labels; not queried)";
 
 function caseLabel(expr: string, labels: Record<string, string>): string {
   const whens = Object.entries(labels).map(([k, v]) => `WHEN ${quoteLit(k)} THEN ${quoteLit(v)}`).join(" ");
-  return `CASE CAST(${expr} AS STRING) ${whens} ELSE 'Other' END`;
+  return `CASE WHEN ${expr} IS NULL THEN 'Missing (null)' ELSE CASE CAST(${expr} AS STRING) ${whens} ELSE 'Other' END END`;
 }
 
 export interface InvestigateOptions {
@@ -264,12 +266,33 @@ export async function investigate(adapter: SqlAdapter, question: string, opts: I
       [A, B] = parsed.periods.map((p) => p.key).sort();
       emit("plan", `Comparing ${A} → ${B} as stated in the question`);
     } else {
-      const cov = await query(`Coverage: trips per ${gran} (to resolve periods)`, `SELECT ${periodExpr} AS period, COUNT(*) AS trips FROM ${T} t GROUP BY ${periodExpr} ORDER BY period`, 5000);
-      const series = cov.rows.filter((r) => r[0] != null).map((r) => ({ key: String(r[0]), n: Number(r[1]) }));
+      const covKey = `coverage:${db}:${fact}:${gran}`;
+      const covMem = opts.rediscover ? undefined : await mem.findByKey(covKey);
+      let series: { key: string; n: number }[];
+      let covCite: Citation;
+      let cov: QueryStep | undefined;
+      if (covMem?.refs?.some((r) => r.startsWith("["))) {
+        series = JSON.parse(covMem.refs.find((r) => r.startsWith("["))!);
+        covCite = { kind: "memory", memoryId: covMem.id };
+        emit("memory", `Trips-per-${gran} coverage recalled from ${covMem.id} (learned in ${covMem.source}); skipping the full-table coverage scan`, covMem.id);
+      } else {
+        cov = await query(`Coverage: trips per ${gran} (to resolve periods)`, `SELECT ${periodExpr} AS period, COUNT(*) AS trips FROM ${T} t GROUP BY ${periodExpr} ORDER BY period`, 5000);
+        series = cov.rows.filter((r) => r[0] != null).map((r) => ({ key: String(r[0]), n: Number(r[1]) }));
+        covCite = { kind: "query", queryId: cov.id, rows: [] };
+        const mx = Math.max(0, ...series.map((x) => x.n));
+        const solidKeys = series.filter((x) => x.n >= mx * 0.1).map((x) => x.key);
+        const cm = await mem.remember({
+          key: covKey,
+          content: `Coverage of ${T}: ${series.length} ${gran}s with data; ${solidKeys.length} have at least 10% of the busiest ${gran}'s trips (${solidKeys[0] ?? "?"} … ${solidKeys[solidKeys.length - 1] ?? "?"}).`,
+          runId: run.id, queryId: cov.id, refs: [JSON.stringify(series)], tags: ["coverage", db, fact, gran], confidence: 0.9, layer: "long_term",
+        });
+        run.memoriesWritten.push(cm.id);
+        emit("memory", `Stored ${gran} coverage as ${cm.id}`, cm.id);
+      }
       const max = Math.max(0, ...series.map((s) => s.n));
       const solid = series.filter((s) => s.n >= max * 0.1);
       const sparse = series.length - solid.length;
-      if (sparse) claim("caveat", `${sparse} ${gran}(s) in ${T} have fewer than 10% of the busiest ${gran}'s trips (likely stray timestamps) and were not used as comparison periods.`, [{ kind: "query", queryId: cov.id, rows: series.map((s, i) => (s.n < max * 0.1 ? i : -1)).filter((i) => i >= 0).slice(0, 20) }]);
+      if (sparse) claim("caveat", `${sparse} ${gran}(s) in ${T} have fewer than 10% of the busiest ${gran}'s trips (likely stray timestamps) and were not used as comparison periods.`, [cov ? { kind: "query", queryId: cov.id, rows: series.map((s, i) => (s.n < max * 0.1 ? i : -1)).filter((i) => i >= 0).slice(0, 20) } : covCite]);
       const resolve = (p: PeriodRef) => {
         if (p.year !== null) return p.key;
         const mm = String(p.month).padStart(2, "0");
@@ -281,17 +304,17 @@ export async function investigate(adapter: SqlAdapter, question: string, opts: I
         const i = solid.findIndex((s) => s.key === keys[0]);
         if (i > 0) { A = solid[i - 1].key; B = keys[0]; }
       } else if (solid.length >= 2) { A = solid[solid.length - 2].key; B = solid[solid.length - 1].key; }
-      emit("plan", A && B ? `Resolved periods from coverage (${cov.id}): ${A} → ${B}` : "Could not resolve two periods with data", cov.id);
+      emit("plan", A && B ? `Resolved periods from coverage (${cov?.id ?? covMem!.id}): ${A} → ${B}` : "Could not resolve two periods with data", cov?.id ?? covMem?.id);
       if (!A || !B) {
         run.status = "unanswerable";
-        claim("check", `Could not find two ${gran}s with enough data to compare for the periods in the question.`, [{ kind: "query", queryId: cov.id, rows: [] }]);
+        claim("check", `Could not find two ${gran}s with enough data to compare for the periods in the question.`, [covCite]);
         run.answer = `There is not enough data in ${T} for the requested periods. [C1]`;
         return run;
       }
     }
     run.plan.periodA = A; run.plan.periodB = B; run.plan.granularity = gran;
 
-    // 6. Headline + data quality.
+    // 6. Build the plan: validity rule, metric terms and the breakdown dimensions.
     const num = metric.num ? D.num(`t.${c[metric.num]}`) : "1";
     const den = metric.den ? D.num(`t.${c[metric.den]}`) : "1";
     const validParts = [`t.${c.pickup} IS NOT NULL`];
@@ -300,10 +323,59 @@ export async function investigate(adapter: SqlAdapter, question: string, opts: I
     if (metric.den === "fare") validParts.push(`${D.num(`t.${c.fare}`)} > 0`);
     const valid = validParts.join(" AND ");
     const inPeriods = `${periodExpr} IN (${quoteLit(A)}, ${quoteLit(B)})`;
-    const headline = await query(
-      `Headline ${metric.label} for ${A} and ${B}, with data-quality counts`,
-      `SELECT ${periodExpr} AS period, COUNT(*) AS trips_all, SUM(CASE WHEN ${valid} THEN 1 ELSE 0 END) AS trips_valid, SUM(CASE WHEN ${valid} THEN ${num} ELSE 0 END) AS num_sum, SUM(CASE WHEN ${valid} THEN ${den} ELSE 0 END) AS den_sum FROM ${T} t WHERE ${inPeriods} GROUP BY ${periodExpr} ORDER BY period`
+
+    const dims: { key: string; label: string; expr: string; join?: string }[] = [];
+    if (c.payment) dims.push({ key: "payment", label: "payment type", expr: str(caseLabel(D.int(`t.${c.payment}`), PAYMENT_LABELS)) });
+    if (c.ratecode) dims.push({ key: "ratecode", label: "rate code", expr: str(caseLabel(D.int(`t.${c.ratecode}`), RATECODE_LABELS)) });
+    if (c.puLocation && zones) dims.push({ key: "borough", label: "pickup borough", expr: `COALESCE(z.${zones.borough}, 'Unknown zone')`, join: `LEFT JOIN ${db}.${zones.table} z ON ${D.int(`t.${c.puLocation}`)} = ${D.int(`z.${zones.id}`)}` });
+    if (c.distance && metric.den !== "distance" && metric.num !== "distance") {
+      const d = D.num(`t.${c.distance}`);
+      dims.push({ key: "distance", label: "trip distance band", expr: `CASE WHEN ${d} < 1 THEN 'a) under 1 mi' WHEN ${d} < 3 THEN 'b) 1–3 mi' WHEN ${d} < 7 THEN 'c) 3–7 mi' WHEN ${d} < 15 THEN 'd) 7–15 mi' ELSE 'e) 15+ mi' END` });
+    }
+    const h = D.hour(`t.${c.pickup}`);
+    dims.push({ key: "hour", label: "time of day", expr: `CASE WHEN ${h} < 6 THEN 'a) overnight 0–5h' WHEN ${h} < 10 THEN 'b) morning 6–9h' WHEN ${h} < 16 THEN 'c) midday 10–15h' WHEN ${h} < 20 THEN 'd) evening 16–19h' ELSE 'e) night 20–23h' END` });
+    run.plan.dimensions = dims.map((d) => d.label);
+    emit("plan", `One scan of ${T} for ${A} and ${B}, grouped by validity × ${dims.map((d) => d.label).join(" × ")}; headline and every breakdown are rolled up from that one result`);
+
+    // 7. ONE federated query returns the whole evidence cube. Scanning a 38M-row CSV
+    //    source in S3 is the expensive part, so every breakdown is derived from these rows.
+    const validExpr = `CASE WHEN ${valid} THEN 1 ELSE 0 END`;
+    const groupExprs = [periodExpr, validExpr, ...dims.map((d) => d.expr)];
+    const cube = await query(
+      `Evidence cube: ${metric.label} terms for ${A} and ${B} by validity and ${dims.length} dimensions (single scan)`,
+      `SELECT ${periodExpr} AS period, ${validExpr} AS is_valid, ${dims.map((d) => `${d.expr} AS d_${d.key}`).join(", ")}, COUNT(*) AS trips, SUM(CASE WHEN ${valid} THEN ${num} ELSE 0 END) AS num_sum, SUM(CASE WHEN ${valid} THEN ${den} ELSE 0 END) AS den_sum FROM ${T} t ${dims.map((d) => d.join ?? "").join(" ")} WHERE ${inPeriods} GROUP BY ${groupExprs.join(", ")}`.replace(/\s+/g, " "),
+      100000,
     );
+    const cubeRows = cube.rows.map((r, i) => ({ i, period: String(r[0]), valid: Number(r[1]) === 1, dims: Object.fromEntries(dims.map((d, k) => [d.key, String(r[2 + k])])), trips: Number(r[2 + dims.length]), num: Number(r[3 + dims.length]), den: Number(r[4 + dims.length]) }));
+    emit("analyze", `${cube.id}: ${cube.rows.length} cube cells; rolling up client-side (no further scans)`, cube.id);
+
+    const rollup = (purpose: string, sqlNote: string, columns: string[], keyOf: (r: (typeof cubeRows)[number]) => string[] | null, withValidity: boolean): QueryStep => {
+      const groups = new Map<string, { key: string[]; trips: number; valid: number; num: number; den: number; src: number[] }>();
+      for (const r of cubeRows) {
+        if (!withValidity && !r.valid) continue;
+        const k = keyOf(r);
+        if (!k) continue;
+        const id = JSON.stringify(k);
+        const g = groups.get(id) ?? { key: k, trips: 0, valid: 0, num: 0, den: 0, src: [] };
+        g.trips += r.trips; if (r.valid) g.valid += r.trips; g.num += r.num; g.den += r.den; g.src.push(r.i);
+        groups.set(id, g);
+      }
+      const ordered = [...groups.values()].sort((x, y) => (x.key.join("\u0000") < y.key.join("\u0000") ? -1 : 1));
+      const step: QueryStep = {
+        id: `Q${++qn}`, purpose, sql: sqlNote, status: "ok", engine: `roll-up of ${cube.id} (client-side, no engine scan)`, elapsedMs: 0,
+        columns, rows: ordered.map((g) => (withValidity ? [...g.key, g.trips, g.valid, g.num, g.den] : [...g.key, g.trips, g.num, g.den])), rowCount: ordered.length,
+        sqlGuard: { level: "low", flags: [], reason: "derived from an already-guarded query" }, dataFindings: [], at: new Date().toISOString(),
+        derivedFrom: { queryId: cube.id, rows: ordered.flatMap((g) => g.src) },
+      };
+      (step as any).sourceRows = ordered.map((g) => g.src);
+      run.steps.push(step);
+      emit("query", `${step.id} = roll-up of ${cube.id}: ${purpose} (${ordered.length} rows)`, step.id);
+      return step;
+    };
+
+    const headline = rollup(`Headline ${metric.label} for ${A} and ${B}, with data-quality counts`,
+      `-- derived from ${cube.id}\nSELECT period, SUM(trips) AS trips_all, SUM(CASE WHEN is_valid=1 THEN trips END) AS trips_valid, SUM(num_sum), SUM(den_sum) FROM ${cube.id} GROUP BY period`,
+      ["period", "trips_all", "trips_valid", "num_sum", "den_sum"], (r) => [r.period], true);
     const hRow = (k: string) => headline.rows.findIndex((r) => String(r[0]) === k);
     const iA = hRow(A), iB = hRow(B);
     if (iA < 0 || iB < 0) {
@@ -326,11 +398,11 @@ export async function investigate(adapter: SqlAdapter, question: string, opts: I
       [{ kind: "query", queryId: headline.id, rows: [iA, iB] }]);
     const excludedA = hA.all - hA.valid, excludedB = hB.all - hB.valid;
     if (!metric.additive && (excludedA || excludedB)) {
-      claim("caveat", `${(excludedA + excludedB).toLocaleString()} trips (${(((excludedA + excludedB) / (hA.all + hB.all)) * 100).toFixed(2)}%) were excluded as invalid for this metric (missing, negative or implausible ${need.join("/")} values).`, [{ kind: "query", queryId: headline.id, rows: [iA, iB] }]);
+      claim("caveat", `${(excludedA + excludedB).toLocaleString()} trips (${pctStr((excludedA + excludedB) / (hA.all + hB.all))}) were excluded as invalid for this metric (missing, negative or implausible ${need.join("/")} values).`, [{ kind: "query", queryId: headline.id, rows: [iA, iB] }]);
     }
     emit("analyze", `Headline: ${fmt(hA.value)} → ${fmt(hB.value)} (${fmtD(delta)})`, headline.id);
 
-    // 7. Cross-run check against memory.
+    // Cross-run check against memory.
     const findingKey = `finding:${db}:${metric.id}:${A}:${B}`;
     const prior = await mem.findByKey(findingKey);
     if (prior) {
@@ -343,23 +415,11 @@ export async function investigate(adapter: SqlAdapter, question: string, opts: I
         [{ kind: "memory", memoryId: prior.id }, { kind: "query", queryId: headline.id, rows: [iA, iB] }]);
     }
 
-    // 8. Driver decomposition per dimension.
-    const dims: { key: string; label: string; expr: string; join?: string }[] = [];
-    if (c.payment) dims.push({ key: "payment", label: "payment type", expr: str(caseLabel(D.int(`t.${c.payment}`), PAYMENT_LABELS)) });
-    if (c.ratecode) dims.push({ key: "ratecode", label: "rate code", expr: str(caseLabel(D.int(`t.${c.ratecode}`), RATECODE_LABELS)) });
-    if (c.puLocation && zones) dims.push({ key: "borough", label: "pickup borough", expr: `COALESCE(z.${zones.borough}, 'Unknown zone')`, join: `LEFT JOIN ${db}.${zones.table} z ON ${D.int(`t.${c.puLocation}`)} = ${D.int(`z.${zones.id}`)}` });
-    if (c.distance && metric.den !== "distance" && metric.num !== "distance") {
-      const d = D.num(`t.${c.distance}`);
-      dims.push({ key: "distance", label: "trip distance band", expr: `CASE WHEN ${d} < 1 THEN 'a) under 1 mi' WHEN ${d} < 3 THEN 'b) 1–3 mi' WHEN ${d} < 7 THEN 'c) 3–7 mi' WHEN ${d} < 15 THEN 'd) 7–15 mi' ELSE 'e) 15+ mi' END` });
-    }
-    const h = D.hour(`t.${c.pickup}`);
-    dims.push({ key: "hour", label: "time of day", expr: `CASE WHEN ${h} < 6 THEN 'a) overnight 0–5h' WHEN ${h} < 10 THEN 'b) morning 6–9h' WHEN ${h} < 16 THEN 'c) midday 10–15h' WHEN ${h} < 20 THEN 'd) evening 16–19h' ELSE 'e) night 20–23h' END` });
-    run.plan.dimensions = dims.map((d) => d.label);
-    emit("plan", `Decomposing the change across ${dims.length} dimensions: ${dims.map((d) => d.label).join(", ")}`);
-
+    // 8. Driver decomposition per dimension (roll-ups of the cube).
     for (const dim of dims) {
-      const step = await query(`Break ${metric.label} down by ${dim.label}`,
-        `SELECT ${periodExpr} AS period, ${dim.expr} AS segment, COUNT(*) AS trips, SUM(${num}) AS num_sum, SUM(${den}) AS den_sum FROM ${T} t ${dim.join ?? ""} WHERE ${valid} AND ${inPeriods} GROUP BY ${periodExpr}, ${dim.expr} ORDER BY period, segment`.replace(/\s+/g, " "));
+      const step = rollup(`Break ${metric.label} down by ${dim.label}`,
+        `-- derived from ${cube.id} (valid trips only)\nSELECT period, d_${dim.key} AS segment, SUM(trips), SUM(num_sum), SUM(den_sum) FROM ${cube.id} WHERE is_valid=1 GROUP BY period, d_${dim.key}`,
+        ["period", "segment", "trips", "num_sum", "den_sum"], (r) => [r.period, r.dims[dim.key]], false);
       const res = decompose(step, A, B, metric);
       const dr: DimensionResult = { dimension: dim.key, label: dim.label, queryId: step.id, ...res,
         matchesHeadline: Math.abs(res.overallA - hA.value) <= 1e-6 * Math.max(1, Math.abs(hA.value)) && Math.abs(res.overallB - hB.value) <= 1e-6 * Math.max(1, Math.abs(hB.value)) };
@@ -377,19 +437,40 @@ export async function investigate(adapter: SqlAdapter, question: string, opts: I
     const drivers: Claim[] = [];
     if (metric.additive) {
       const all = okDims.flatMap((d) => d.segments.map((s) => ({ d, s }))).sort((x, y) => Math.abs(y.s.contribution) - Math.abs(x.s.contribution));
-      for (const { d, s } of pickTop(all, 3)) {
-        drivers.push(claim("driver", `${s.segment} (${d.label}): ${s.A.trips.toLocaleString()} → ${s.B.trips.toLocaleString()} trips (${fmtD(s.contribution)}${delta !== 0 ? `, ${share(s.contribution, delta)} of the change` : ""}).`, [cite(d, s)]));
+      const picked: { d: DimensionResult; s: SegmentResult; c: Claim }[] = [];
+      for (const { d, s } of pickTop(all, 8)) {
+        const twin = picked.find((p) => p.d.dimension !== d.dimension && p.s.A.trips === s.A.trips && p.s.B.trips === s.B.trips);
+        if (twin) {
+          twin.c.text += ` The same trips are also "${s.segment}" by ${d.label}, so this is one population, not two separate drivers.`;
+          twin.c.citations.push(cite(d, s));
+          continue;
+        }
+        if (picked.length >= 3) break;
+        const dc = claim("driver", `${s.segment} (${d.label}): ${s.A.trips.toLocaleString()} → ${s.B.trips.toLocaleString()} trips (${fmtD(s.contribution)}${delta !== 0 ? `, ${share(s.contribution, delta)} of the change` : ""}).`, [cite(d, s)]);
+        drivers.push(dc);
+        picked.push({ d, s, c: dc });
       }
     } else {
       const best = [...okDims].sort((x, y) => Math.abs(y.mixTotal) - Math.abs(x.mixTotal))[0];
       const all = okDims.flatMap((d) => d.segments.map((s) => ({ d, s }))).sort((x, y) => Math.abs(y.s.contribution) - Math.abs(x.s.contribution));
-      for (const { d, s } of pickTop(all, 4)) {
+      const picked: { d: DimensionResult; s: SegmentResult; c: Claim }[] = [];
+      for (const { d, s } of pickTop(all, 8)) {
         if (Math.abs(s.contribution) < Math.abs(delta) * 0.05) continue;
+        // Same trip counts in both periods under a different dimension = the same population seen twice.
+        const twin = picked.find((p) => p.d.dimension !== d.dimension && p.s.A.trips === s.A.trips && p.s.B.trips === s.B.trips);
+        if (twin) {
+          twin.c.text += ` The same ${s.A.trips.toLocaleString()} → ${s.B.trips.toLocaleString()} trips are also "${s.segment}" by ${d.label}, so this is one population, not two separate drivers.`;
+          twin.c.citations.push(cite(d, s));
+          continue;
+        }
+        if (picked.length >= 4) break;
         const mixLed = Math.abs(s.mix) >= Math.abs(s.rate);
         const text = mixLed
           ? `Mix shift — ${s.segment} (${d.label}) went from ${(s.A.weight * 100).toFixed(1)}% to ${(s.B.weight * 100).toFixed(1)}% of ${metric.den === "fare" ? "fare dollars" : metric.den === "distance" ? "miles" : "trips"}; its ${metric.label} (${s.A.value == null ? "n/a" : fmt(s.A.value)} in ${A}) is ${s.A.value != null && s.A.value > d.overallA ? "above" : "below"} average, so the shift moved the overall by ${fmtD(s.mix)} (total contribution ${fmtD(s.contribution)}).`
-          : `Within-segment change — for ${s.segment} (${d.label}) trips, ${metric.label} moved from ${s.A.value == null ? "n/a" : fmt(s.A.value)} to ${s.B.value == null ? "n/a" : fmt(s.B.value)}, contributing ${fmtD(s.rate)} (total contribution ${fmtD(s.contribution)}).`;
-        drivers.push(claim("driver", text, [cite(d, s)]));
+          : `Within-segment change — for ${s.segment} (${d.label}) trips, ${metric.label} moved from ${s.A.value == null ? "n/a" : fmt(s.A.value)} to ${s.B.value == null ? "n/a" : fmt(s.B.value)}, contributing ${fmtD(s.rate)}${Math.abs(s.contribution - s.rate) > 0.005 * Math.abs(delta) ? ` (total contribution ${fmtD(s.contribution)})` : ""}.`;
+        const dc = claim("driver", text, [cite(d, s)]);
+        drivers.push(dc);
+        picked.push({ d, s, c: dc });
         const small = Math.min(s.A.trips, s.B.trips);
         if (small < 30) claim("caveat", `${s.segment} has only ${small} trips in one period; treat its effect as noisy.`, [cite(d, s)]);
       }
@@ -456,6 +537,11 @@ export async function investigate(adapter: SqlAdapter, question: string, opts: I
   } finally {
     run.finishedAt = new Date().toISOString();
   }
+}
+
+function pctStr(x: number): string {
+  const p = x * 100;
+  return p >= 0.1 || p === 0 ? `${p.toFixed(2)}%` : `${p.toPrecision(2)}%`;
 }
 
 function pickTop<T extends { d: { dimension: string } }>(items: T[], n: number): T[] {

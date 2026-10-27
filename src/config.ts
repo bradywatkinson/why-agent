@@ -20,7 +20,9 @@ export function loadDotEnv(file = path.join(process.cwd(), ".env")): void {
 }
 
 export function makeAdapter(): SqlAdapter {
-  if (process.env.AGENT_ADAPTER === "fixture") return new FixtureAdapter();
-  const cfg = zetarisConfigFromEnv();
-  return cfg ? new ZetarisAdapter(cfg) : new FixtureAdapter();
+  const cfg = process.env.AGENT_ADAPTER === "fixture" ? undefined : zetarisConfigFromEnv();
+  const adapter: SqlAdapter = cfg ? new ZetarisAdapter(cfg) : new FixtureAdapter();
+  // Keep live and fixture memories apart so a synthetic finding is never recalled as evidence about real data.
+  process.env.MEMORY_DIR ??= path.join(process.cwd(), ".memory", adapter.kind);
+  return adapter;
 }

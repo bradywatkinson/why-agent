@@ -25,7 +25,7 @@ export async function hmem(): Promise<any> {
   if (!instance) {
     const { HMEM } = await loadHMEM();
     const dir = process.env.MEMORY_DIR ?? path.join(process.cwd(), ".memory");
-    instance = new HMEM({ persistDir: dir, actor: "why-agent" });
+    instance = new HMEM({ persistDir: dir });
   }
   return instance;
 }

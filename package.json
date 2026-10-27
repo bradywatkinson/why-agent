@@ -15,7 +15,9 @@
     "zetaris:check": "tsx src/cli.ts sql \"SHOW LIGHTNING DATABASES\""
   },
   "devDependencies": {
-    "tsx": "^4.19.0"
+    "@types/node": "^26.6.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "sql.js": "^1.15.2"
