@@ -11,5 +11,8 @@
   },
   "devDependencies": {
     "tsx": "^4.19.0"
+  },
+  "dependencies": {
+    "sql.js": "^1.15.2"
   }
 }
