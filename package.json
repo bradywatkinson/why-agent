@@ -1,13 +1,18 @@
 {
-  "name": "agentathon-starter",
+  "name": "why-agent",
   "version": "0.1.0",
-  "description": "Meterless hackathon starter: a research notebook agent with real H-MEM memory. Zero API keys required.",
+  "description": "An agent that explains why a business metric changed, with every claim cited to Zetaris query rows. Memory: Meterless H-MEM. Guard: Scout-style.",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "setup": "npx --yes degit meterless/meterless/engines/hmem/reference vendor/hmem && cd vendor/hmem && npm install --no-audit --no-fund",
-    "notebook": "tsx notebook.ts"
+    "notebook": "tsx notebook.ts",
+    "start": "tsx src/server.ts",
+    "ask": "tsx src/cli.ts ask",
+    "test": "tsx --test test/*.test.ts",
+    "scout:evals": "./scripts/scout-evals.sh",
+    "zetaris:check": "tsx src/cli.ts sql \"SHOW LIGHTNING DATABASES\""
   },
   "devDependencies": {
     "tsx": "^4.19.0"

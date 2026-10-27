@@ -41,7 +41,7 @@ const OUT_OF_BAND: [string, RegExp][] = [
   ["out-of-band-tool", /\b\w*(admin_panel|internal_\w+|shell|exec|sudo)\b/i],
   ["privilege-escalation", /\bgrant\b[^.\n]{0,30}\b(admin|access|privileges?|role)\b/i],
   ["side-effect", /\b(e-?mail|send|publish|upload)\b[^.\n]{0,40}\b(every|all|customers?|records?|them|me)\b/i],
-  ["destructive", /\b(drop|delete|truncate|alter|insert|update|create|grant|revoke)\b\s+(table|database|from|into|the\b|all\b|\w+\s+table)/i],
+  ["destructive", /\b(drop|truncate|alter)\s+(the\s+)?(\w+\s+)?(table|database|schema)\b|\bdelete\s+from\b|\binsert\s+into\b|\bupdate\s+\w+\s+set\b/i],
 ];
 
 const PII_COLUMN = /(^|_)(name|first_?name|last_?name|email|phone|address|street|ssn|dob|birth|card_?number|passport)($|_)/i;
