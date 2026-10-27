@@ -1,0 +1,15 @@
+import { chromium } from "playwright";
+const b = await chromium.launch({ executablePath: "/usr/bin/google-chrome", args: ["--no-sandbox"] });
+const ctx = await b.newContext({ viewport: { width: 1600, height: 900 } });
+const p = await ctx.newPage();
+await p.goto("http://localhost:3000");
+await p.getByPlaceholder("Enter your username").fill("admin@zetaris.com");
+await p.getByPlaceholder("Enter your password").fill(process.env.ZPW);
+await p.getByRole("button", { name: /sign in/i }).click();
+await p.waitForTimeout(5000);
+await ctx.storageState({ path: "/workspace/demo-build/zstate.json" });
+await p.screenshot({ path: "/workspace/demo-build/z1.png" });
+console.log(p.url());
+const links = await p.$$eval("a,button", (els) => els.map((e) => (e.textContent || e.getAttribute("aria-label") || "").trim()).filter(Boolean).slice(0, 60));
+console.log(links.join(" | "));
+await b.close();
